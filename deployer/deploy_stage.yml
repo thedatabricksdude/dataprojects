@@ -185,7 +185,7 @@ jobs:
 
             out_file="$(mktemp)"
             set +e
-            databricks bundle run "$job" -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" >"$out_file" 2>&1
+            databricks bundle run "$job" -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" --bundle-root "${{ steps.bundle_dir.outputs.bundle_run_dir }}" >"$out_file" 2>&1
             rc=$?
             set -e
 
@@ -244,10 +244,7 @@ jobs:
           echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
           ls -la
           # Print resolved workspace host so we can confirm correct target
-          databricks bundle validate -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" | \
-            jq '{workspace: .workspace, bundle: .bundle.name}' || true
-          databricks bundle validate -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}"
-
+          databricks bundle validate -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" --bundle-root "${{ steps.bundle_dir.outputs.bundle_run_dir }}" --output json | jq .
       - name: Deploy
         if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
@@ -258,7 +255,7 @@ jobs:
           echo "DEBUG: landing_zone=${LANDING_ZONE}"
           echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
           ls -la
-          databricks bundle deploy -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" --auto-approve --force-lock
+          databricks bundle deploy -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" --bundle-root "${{ steps.bundle_dir.outputs.bundle_run_dir }}" --auto-approve --force-lock
 
       - name: Destroy
         if: ${{ inputs.destroy_bundle != '' }}
@@ -270,7 +267,7 @@ jobs:
           echo "DEBUG: landing_zone=${LANDING_ZONE}"
           echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
           ls -la
-          databricks bundle destroy -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" --auto-approve --force-lock
+          databricks bundle destroy -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" --bundle-root "${{ steps.bundle_dir.outputs.bundle_run_dir }}" --auto-approve --force-lock
 
       ########################################
       # POSTDEPLOY (skipped on destroy)
@@ -293,7 +290,7 @@ jobs:
 
             out_file="$(mktemp)"
             set +e
-            databricks bundle run "$job" -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" >"$out_file" 2>&1
+            databricks bundle run "$job" -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" --bundle-root "${{ steps.bundle_dir.outputs.bundle_run_dir }}" >"$out_file" 2>&1
             rc=$?
             set -e
 
