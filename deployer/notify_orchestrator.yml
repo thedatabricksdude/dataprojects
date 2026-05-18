@@ -46,6 +46,7 @@ jobs:
           target=""
           skip="false"
           dbx_bundle_dir=""
+          dbx_destroy_bundle=""
 
           # If the PR was closed but not merged, skip dispatch completely.
           if [[ "${ACTION}" == "closed" && "${MERGED}" != "true" ]]; then
@@ -55,6 +56,7 @@ jobs:
             echo "event_type=${event_type}" >> "$GITHUB_OUTPUT"
             echo "target=${target}" >> "$GITHUB_OUTPUT"
             echo "dbx_bundle_dir=${dbx_bundle_dir}" >> "$GITHUB_OUTPUT"
+            echo "dbx_destroy_bundle=${dbx_destroy_bundle}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -112,6 +114,13 @@ jobs:
             dbx_bundle_dir="$(printf '%s' "${dbx_bundle_dir}" | sed -E 's/.*[:=][[:space:]]*//I' | xargs)"
           fi
 
+          # Extract DBX_DESTROY_BUNDLE tag from PR body if present
+          dbx_destroy_bundle="$(printf '%s\n' "${PR_BODY}" \
+            | grep -Eoi 'DBX_DESTROY_BUNDLE[:=][[:space:]]*[^[:space:]]+' | head -n1 || true)"
+          if [[ -n "${dbx_destroy_bundle}" ]]; then
+            dbx_destroy_bundle="$(printf '%s' "${dbx_destroy_bundle}" | sed -E 's/.*[:=][[:space:]]*//I' | xargs)"
+          fi
+
           echo "skip=${skip}" >> "$GITHUB_OUTPUT"
           echo "event_type=${event_type}" >> "$GITHUB_OUTPUT"
           echo "target=${target}" >> "$GITHUB_OUTPUT"
@@ -149,8 +158,8 @@ jobs:
           PLAN_EVENT_TYPE: ${{ steps.plan.outputs.event_type }}
           PLAN_TARGET: ${{ steps.plan.outputs.target }}
           PLAN_DBX_BUNDLE_DIR: ${{ steps.plan.outputs.dbx_bundle_dir || '' }}
+          PLAN_DBX_DESTROY_BUNDLE: ${{ steps.plan.outputs.dbx_destroy_bundle || '' }}
           LANDING_ZONES: ${{ vars.DBX_LANDING_ZONES || '' }}
-          DBX_DESTROY_BUNDLE: ${{ vars.DBX_DESTROY_BUNDLE || '' }}
 
           # commit SHAs from PR event; we choose merge_commit_sha for promote (landing commit)
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -184,7 +193,7 @@ jobs:
             --arg pr_number "${PR_NUMBER}" \
             --arg dbx_bundle_dir "${PLAN_DBX_BUNDLE_DIR:-}" \
             --arg landing_zones "${LANDING_ZONES:-}" \
-            --arg destroy_bundle "${DBX_DESTROY_BUNDLE:-}" \
+            --arg destroy_bundle "${PLAN_DBX_DESTROY_BUNDLE:-}" \
             '{
               repo_full_name: $repo_full_name,
               repo: $repo,
@@ -217,7 +226,7 @@ jobs:
               --arg target "${PLAN_TARGET}" \
               --arg dbx_bundle_dir "${PLAN_DBX_BUNDLE_DIR:-}" \
               --arg landing_zones "${LANDING_ZONES:-}" \
-              --arg destroy_bundle "${DBX_DESTROY_BUNDLE:-}" \
+              --arg destroy_bundle "${PLAN_DBX_DESTROY_BUNDLE:-}" \
               '{
                 ref: $ref,
                 inputs: {
