@@ -32,6 +32,10 @@ on:
         required: false
       dbx_bundle_dir:
         required: false
+      landing_zones:
+        required: false
+      destroy_bundle:
+        required: false
 
 env:
   KEEP_FED_POLICY: ${{ vars.KEEP_FED_POLICY || 'false' }}
