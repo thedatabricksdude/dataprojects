@@ -203,6 +203,7 @@ jobs:
     if: ${{ fromJSON(needs.resolve.outputs.dev) }}
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         landing_zone: ${{ fromJSON(needs.resolve.outputs.landing_zones) }}
     uses: ./.github/workflows/deploy_stage.yml
@@ -222,6 +223,7 @@ jobs:
     if: ${{ needs.dev.result == 'success' && fromJSON(needs.resolve.outputs.qa) }}
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         landing_zone: ${{ fromJSON(needs.resolve.outputs.landing_zones) }}
     uses: ./.github/workflows/deploy_stage.yml
@@ -241,6 +243,7 @@ jobs:
     if: ${{ needs.dev.result == 'success' && fromJSON(needs.resolve.outputs.uat) && (needs.qa.result == 'success' || needs.qa.result == 'skipped') }}
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         landing_zone: ${{ fromJSON(needs.resolve.outputs.landing_zones) }}
     uses: ./.github/workflows/deploy_stage.yml
@@ -260,6 +263,7 @@ jobs:
     if: ${{ needs.dev.result == 'success' && fromJSON(needs.resolve.outputs.prod) && (needs.qa.result == 'success' || needs.qa.result == 'skipped') && (needs.uat.result == 'success' || needs.uat.result == 'skipped') }}
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         landing_zone: ${{ fromJSON(needs.resolve.outputs.landing_zones) }}
     uses: ./.github/workflows/deploy_stage.yml
