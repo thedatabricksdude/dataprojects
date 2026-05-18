@@ -36,7 +36,7 @@ on:
 env:
   KEEP_FED_POLICY: ${{ vars.KEEP_FED_POLICY || 'false' }}
   DEBUG: ${{ vars.DEBUG || '' }}
-  LANDING_ZONES: ${{ vars.LANDING_ZONES || 'default' }}
+  LANDING_ZONES: ${{ vars.DBX_LANDING_ZONES || 'da-north,eus2-analytics' }}
 
 concurrency:
   group: deploy-${{ inputs.repo_full_name || github.event.client_payload.repo_full_name }}-${{ inputs.sha || github.event.client_payload.sha }}
