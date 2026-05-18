@@ -101,6 +101,8 @@ jobs:
           TARGET_FROM_CLIENT_PAYLOAD: ${{ github.event.client_payload.target || '' }}
           EVENT_TYPE_FROM_CLIENT_PAYLOAD: ${{ github.event.client_payload.event_type || '' }}
           DBX_FROM_CLIENT_PAYLOAD: ${{ github.event.client_payload.dbx_bundle_dir || '' }}
+          LANDING_ZONES_FROM_CLIENT_PAYLOAD: ${{ github.event.client_payload.landing_zones || '' }}
+          DESTROY_BUNDLE_FROM_CLIENT_PAYLOAD: ${{ github.event.client_payload.destroy_bundle || '' }}
 
         run: |
           set -euo pipefail
@@ -111,6 +113,7 @@ jobs:
           target_raw=""
           event_type=""
           dbx_bundle_dir=""
+          destroy_bundle=""
 
           if [[ "${IS_DISPATCH}" == "true" ]]; then
             repo="${REPO_FROM_CLIENT_PAYLOAD}"
@@ -119,6 +122,8 @@ jobs:
             target_raw="${TARGET_FROM_CLIENT_PAYLOAD}"
             event_type="${EVENT_TYPE_FROM_CLIENT_PAYLOAD}"
             dbx_bundle_dir="${DBX_FROM_CLIENT_PAYLOAD}"
+            LANDING_ZONES="${LANDING_ZONES_FROM_CLIENT_PAYLOAD}"
+            destroy_bundle="${DESTROY_BUNDLE_FROM_CLIENT_PAYLOAD}"
           fi
 
           if [[ "${EVENT_NAME}" == "workflow_dispatch" && -n "${CLIENT_PAYLOAD_JSON}" ]]; then

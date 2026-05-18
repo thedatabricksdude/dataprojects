@@ -125,6 +125,7 @@ jobs:
           echo "event_type=${event_type}" >> "$GITHUB_OUTPUT"
           echo "target=${target}" >> "$GITHUB_OUTPUT"
           echo "dbx_bundle_dir=${dbx_bundle_dir}" >> "$GITHUB_OUTPUT"
+          echo "dbx_destroy_bundle=${dbx_destroy_bundle}" >> "$GITHUB_OUTPUT"
 
       - name: Debug resolved plan
         if: ${{ steps.guard.outputs.skip != 'true' && steps.plan.outputs.skip != 'true' && env.DEBUG != '' }}
