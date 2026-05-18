@@ -1,0 +1,251 @@
+name: Deploy to workspace (DEV/QA/UAT/PROD)
+
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  repository_dispatch:
+    types: [promote, deploy_dev, promote_request]
+  workflow_dispatch:
+    inputs:
+      repo_full_name:
+        required: false
+      sha:
+        required: false
+      pr_number:
+        required: false
+      deployment_target:
+        required: false
+        type: choice
+        options:
+          - qa
+          - uat
+          - prod
+          - qa-uat
+          - qa-uat-prod
+      client_payload_json:
+        required: false
+      event_type:
+        required: false
+      target:
+        required: false
+      dbx_bundle_dir:
+        required: false
+
+env:
+  KEEP_FED_POLICY: ${{ vars.KEEP_FED_POLICY || 'false' }}
+  DEBUG: ${{ vars.DEBUG || '' }}
+  LANDING_ZONES: ${{ vars.LANDING_ZONES || 'default' }}
+
+concurrency:
+  group: deploy-${{ inputs.repo_full_name || github.event.client_payload.repo_full_name }}-${{ inputs.sha || github.event.client_payload.sha }}
+  cancel-in-progress: false
+
+jobs:
+  ########################################
+  # RESOLVE
+  ########################################
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      repo: ${{ steps.o.outputs.repo }}
+      sha: ${{ steps.o.outputs.sha }}
+      pr_number: ${{ steps.o.outputs.pr_number }}
+      dev: ${{ steps.o.outputs.dev }}
+      qa: ${{ steps.o.outputs.qa }}
+      uat: ${{ steps.o.outputs.uat }}
+      prod: ${{ steps.o.outputs.prod }}
+      target: ${{ steps.o.outputs.target }}
+      event_type: ${{ steps.o.outputs.event_type }}
+      dbx_bundle_dir: ${{ steps.o.outputs.dbx_bundle_dir }}
+      landing_zones: ${{ steps.o.outputs.landing_zones }}
+
+    steps:
+      - id: o
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IS_DISPATCH: ${{ github.event_name == 'repository_dispatch' }}
+
+          CLIENT_PAYLOAD_JSON: ${{ github.event.inputs.client_payload_json || '' }}
+          INPUT_EVENT_TYPE: ${{ github.event.inputs.event_type || '' }}
+          INPUT_TARGET: ${{ github.event.inputs.target || '' }}
+          IN_REPO: ${{ github.event.inputs.repo_full_name || '' }}
+          IN_SHA: ${{ github.event.inputs.sha || '' }}
+          IN_PR_NUMBER: ${{ github.event.inputs.pr_number || '' }}
+          IN_DEPLOYMENT_TARGET: ${{ inputs.deployment_target || '' }}
+          IN_DBX_BUNDLE_DIR: ${{ github.event.inputs.dbx_bundle_dir || '' }}
+
+          REPO_FROM_CLIENT_PAYLOAD: ${{ github.event.client_payload.repo_full_name || '' }}
+          SHA_FROM_CLIENT_PAYLOAD: ${{ github.event.client_payload.sha || '' }}
+          PR_NUMBER_FROM_CLIENT_PAYLOAD: ${{ github.event.client_payload.pr_number || '' }}
+          TARGET_FROM_CLIENT_PAYLOAD: ${{ github.event.client_payload.target || '' }}
+          EVENT_TYPE_FROM_CLIENT_PAYLOAD: ${{ github.event.client_payload.event_type || '' }}
+          DBX_FROM_CLIENT_PAYLOAD: ${{ github.event.client_payload.dbx_bundle_dir || '' }}
+
+        run: |
+          set -euo pipefail
+
+          repo=""
+          sha=""
+          pr_number=""
+          target_raw=""
+          event_type=""
+          dbx_bundle_dir=""
+
+          if [[ "${IS_DISPATCH}" == "true" ]]; then
+            repo="${REPO_FROM_CLIENT_PAYLOAD}"
+            sha="${SHA_FROM_CLIENT_PAYLOAD}"
+            pr_number="${PR_NUMBER_FROM_CLIENT_PAYLOAD}"
+            target_raw="${TARGET_FROM_CLIENT_PAYLOAD}"
+            event_type="${EVENT_TYPE_FROM_CLIENT_PAYLOAD}"
+            dbx_bundle_dir="${DBX_FROM_CLIENT_PAYLOAD}"
+          fi
+
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" && -n "${CLIENT_PAYLOAD_JSON}" ]]; then
+            repo="$(echo "$CLIENT_PAYLOAD_JSON" | jq -r '.repo_full_name')"
+            sha="$(echo "$CLIENT_PAYLOAD_JSON" | jq -r '.sha')"
+            pr_number="$(echo "$CLIENT_PAYLOAD_JSON" | jq -r '.pr_number // ""')"
+            target_raw="$(echo "$CLIENT_PAYLOAD_JSON" | jq -r '.target')"
+            dbx_bundle_dir="$(echo "$CLIENT_PAYLOAD_JSON" | jq -r '.dbx_bundle_dir // ""')"
+            event_type="$(echo "$CLIENT_PAYLOAD_JSON" | jq -r '.event_type // ""')"
+          fi
+
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" && -z "${CLIENT_PAYLOAD_JSON}" ]]; then
+            repo="${IN_REPO}"
+            sha="${IN_SHA}"
+            pr_number="${IN_PR_NUMBER}"
+            target_raw="${IN_DEPLOYMENT_TARGET}"
+            dbx_bundle_dir="${IN_DBX_BUNDLE_DIR}"
+          fi
+
+          if [[ -z "$repo" || -z "$sha" ]]; then
+            echo "ERROR: repo/sha missing"
+            exit 1
+          fi
+
+          dev=false
+          qa=false
+          uat=false
+          prod=false
+
+          target="$(echo "$target_raw" | tr '[:upper:]' '[:lower:]')"
+
+          dev=true
+
+          case "$target" in
+            dev) ;;
+            qa) qa=true ;;
+            uat) uat=true ;;
+            prod) prod=true ;;
+            qa-uat) qa=true; uat=true ;;
+            qa-uat-prod) qa=true; uat=true; prod=true ;;
+            *)
+              echo "ERROR invalid target"
+              exit 1
+              ;;
+          esac
+
+          # Build landing zones JSON array
+          # If vars.LANDING_ZONES is unset/empty, workflow env default 'default' is used
+          if [[ -z "${LANDING_ZONES}" || "${LANDING_ZONES}" == "default" ]]; then
+            lz_json='["default"]'
+          else
+            # Split on commas, trim whitespace from each item, build JSON array
+            lz_json="$(echo "${LANDING_ZONES}" | \
+              tr ',' '\n' | \
+              sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | \
+              jq -R . | \
+              jq -sc .)"
+          fi
+
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          echo "event_type=$event_type" >> "$GITHUB_OUTPUT"
+          echo "dbx_bundle_dir=$dbx_bundle_dir" >> "$GITHUB_OUTPUT"
+          echo "dev=$dev" >> "$GITHUB_OUTPUT"
+          echo "qa=$qa" >> "$GITHUB_OUTPUT"
+          echo "uat=$uat" >> "$GITHUB_OUTPUT"
+          echo "prod=$prod" >> "$GITHUB_OUTPUT"
+          echo "landing_zones=$lz_json" >> "$GITHUB_OUTPUT"
+
+  ########################################
+  # STAGES
+  # Each stage fans out across all landing zones via matrix.
+  # Stages remain sequential: qa waits for all dev LZs, etc.
+  ########################################
+
+  dev:
+    needs: resolve
+    if: ${{ fromJSON(needs.resolve.outputs.dev) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        landing_zone: ${{ fromJSON(needs.resolve.outputs.landing_zones) }}
+    uses: ./.github/workflows/deploy_stage.yml
+    with:
+      repo: ${{ needs.resolve.outputs.repo }}
+      sha: ${{ needs.resolve.outputs.sha }}
+      pr_number: ${{ needs.resolve.outputs.pr_number }}
+      stage_name: dev
+      target_env: DEV
+      dbx_bundle_dir: ${{ needs.resolve.outputs.dbx_bundle_dir }}
+      landing_zone: ${{ matrix.landing_zone }}
+    secrets: inherit
+
+  qa:
+    needs: [resolve, dev]
+    if: ${{ needs.dev.result == 'success' && fromJSON(needs.resolve.outputs.qa) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        landing_zone: ${{ fromJSON(needs.resolve.outputs.landing_zones) }}
+    uses: ./.github/workflows/deploy_stage.yml
+    with:
+      repo: ${{ needs.resolve.outputs.repo }}
+      sha: ${{ needs.resolve.outputs.sha }}
+      pr_number: ${{ needs.resolve.outputs.pr_number }}
+      stage_name: qa
+      target_env: QA
+      dbx_bundle_dir: ${{ needs.resolve.outputs.dbx_bundle_dir }}
+      landing_zone: ${{ matrix.landing_zone }}
+    secrets: inherit
+
+  uat:
+    needs: [resolve, dev, qa]
+    if: ${{ needs.dev.result == 'success' && fromJSON(needs.resolve.outputs.uat) && (needs.qa.result == 'success' || needs.qa.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        landing_zone: ${{ fromJSON(needs.resolve.outputs.landing_zones) }}
+    uses: ./.github/workflows/deploy_stage.yml
+    with:
+      repo: ${{ needs.resolve.outputs.repo }}
+      sha: ${{ needs.resolve.outputs.sha }}
+      pr_number: ${{ needs.resolve.outputs.pr_number }}
+      stage_name: uat
+      target_env: UAT
+      dbx_bundle_dir: ${{ needs.resolve.outputs.dbx_bundle_dir }}
+      landing_zone: ${{ matrix.landing_zone }}
+    secrets: inherit
+
+  prod:
+    needs: [resolve, dev, qa, uat]
+    if: ${{ needs.dev.result == 'success' && fromJSON(needs.resolve.outputs.prod) && (needs.qa.result == 'success' || needs.qa.result == 'skipped') && (needs.uat.result == 'success' || needs.uat.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        landing_zone: ${{ fromJSON(needs.resolve.outputs.landing_zones) }}
+    uses: ./.github/workflows/deploy_stage.yml
+    with:
+      repo: ${{ needs.resolve.outputs.repo }}
+      sha: ${{ needs.resolve.outputs.sha }}
+      pr_number: ${{ needs.resolve.outputs.pr_number }}
+      stage_name: prod
+      target_env: PROD
+      dbx_bundle_dir: ${{ needs.resolve.outputs.dbx_bundle_dir }}
+      landing_zone: ${{ matrix.landing_zone }}
+    secrets: inherit
