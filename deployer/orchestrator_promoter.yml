@@ -62,6 +62,19 @@ jobs:
       landing_zones: ${{ steps.o.outputs.landing_zones }}
 
     steps:
+      ########################################
+      # DEBUG - remove once vars issue resolved
+      ########################################
+      - name: Debug vars context
+        run: |
+          echo "=== Expression layer ==="
+          echo "KEEP_FED_POLICY=${{ vars.KEEP_FED_POLICY }}"
+          echo "DEBUG=${{ vars.DEBUG }}"
+          echo "DBX_LANDING_ZONES=${{ vars.DBX_LANDING_ZONES }}"
+          echo "=== Env layer ==="
+          echo "KEEP_FED_POLICY_ENV=$KEEP_FED_POLICY"
+          echo "LANDING_ZONES_ENV=$LANDING_ZONES"
+
       - id: o
         shell: bash
         env:
@@ -148,17 +161,20 @@ jobs:
           esac
 
           # Build landing zones JSON array
-          # If vars.LANDING_ZONES is unset/empty, workflow env default 'default' is used
+          # LANDING_ZONES comes from workflow-level env (vars.DBX_LANDING_ZONES)
+          echo "DEBUG: LANDING_ZONES raw='${LANDING_ZONES}'"
+
           if [[ -z "${LANDING_ZONES}" || "${LANDING_ZONES}" == "default" ]]; then
             lz_json='["default"]'
           else
-            # Split on commas, trim whitespace from each item, build JSON array
             lz_json="$(echo "${LANDING_ZONES}" | \
               tr ',' '\n' | \
               sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | \
               jq -R . | \
               jq -sc .)"
           fi
+
+          echo "DEBUG: lz_json=$lz_json"
 
           echo "repo=$repo" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
