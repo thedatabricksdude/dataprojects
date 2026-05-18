@@ -60,6 +60,7 @@ jobs:
       event_type: ${{ steps.o.outputs.event_type }}
       dbx_bundle_dir: ${{ steps.o.outputs.dbx_bundle_dir }}
       landing_zones: ${{ steps.o.outputs.landing_zones }}
+      destroy_bundle: ${{ steps.o.outputs.destroy_bundle }}
 
     steps:
       ########################################
@@ -123,6 +124,8 @@ jobs:
             target_raw="$(echo "$CLIENT_PAYLOAD_JSON" | jq -r '.target')"
             dbx_bundle_dir="$(echo "$CLIENT_PAYLOAD_JSON" | jq -r '.dbx_bundle_dir // ""')"
             event_type="$(echo "$CLIENT_PAYLOAD_JSON" | jq -r '.event_type // ""')"
+            LANDING_ZONES="$(echo "$CLIENT_PAYLOAD_JSON" | jq -r '.landing_zones // ""')"
+            destroy_bundle="$(echo "$CLIENT_PAYLOAD_JSON" | jq -r '.destroy_bundle // ""')"
           fi
 
           if [[ "${EVENT_NAME}" == "workflow_dispatch" && -z "${CLIENT_PAYLOAD_JSON}" ]]; then
@@ -187,6 +190,7 @@ jobs:
           echo "uat=$uat" >> "$GITHUB_OUTPUT"
           echo "prod=$prod" >> "$GITHUB_OUTPUT"
           echo "landing_zones=$lz_json" >> "$GITHUB_OUTPUT"
+          echo "destroy_bundle=${destroy_bundle:-}" >> "$GITHUB_OUTPUT"
 
   ########################################
   # STAGES
@@ -210,6 +214,7 @@ jobs:
       target_env: DEV
       dbx_bundle_dir: ${{ needs.resolve.outputs.dbx_bundle_dir }}
       landing_zone: ${{ matrix.landing_zone }}
+      destroy_bundle: ${{ needs.resolve.outputs.destroy_bundle }}
     secrets: inherit
 
   qa:
@@ -228,6 +233,7 @@ jobs:
       target_env: QA
       dbx_bundle_dir: ${{ needs.resolve.outputs.dbx_bundle_dir }}
       landing_zone: ${{ matrix.landing_zone }}
+      destroy_bundle: ${{ needs.resolve.outputs.destroy_bundle }}
     secrets: inherit
 
   uat:
@@ -246,6 +252,7 @@ jobs:
       target_env: UAT
       dbx_bundle_dir: ${{ needs.resolve.outputs.dbx_bundle_dir }}
       landing_zone: ${{ matrix.landing_zone }}
+      destroy_bundle: ${{ needs.resolve.outputs.destroy_bundle }}
     secrets: inherit
 
   prod:
@@ -264,4 +271,5 @@ jobs:
       target_env: PROD
       dbx_bundle_dir: ${{ needs.resolve.outputs.dbx_bundle_dir }}
       landing_zone: ${{ matrix.landing_zone }}
+      destroy_bundle: ${{ needs.resolve.outputs.destroy_bundle }}
     secrets: inherit

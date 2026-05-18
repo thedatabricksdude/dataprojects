@@ -28,6 +28,10 @@ on:
         required: false
         type: string
         default: default
+      destroy_bundle:
+        required: false
+        type: string
+        default: ''
     secrets:
       GH_APP_PRIVATE_KEY:
         required: true
@@ -52,8 +56,8 @@ jobs:
       DATABRICKS_CLIENT_ID: ${{ vars.DEPLOYER_CLIENT_ID }}
       DEBUG: ${{ inputs.debug || '' }}
       KEEP_FED_POLICY: ${{ vars.KEEP_FED_POLICY || 'false' }}
-      # Resolve landing zone: use input value; fall back to 'default' if empty
       LANDING_ZONE: ${{ inputs.landing_zone != '' && inputs.landing_zone || 'default' }}
+      DESTROY_BUNDLE: ${{ inputs.destroy_bundle || '' }}
 
     steps:
       - name: Generate GitHub App Token
@@ -161,16 +165,16 @@ jobs:
             -d "$body"
 
       ########################################
-      # PREDEPLOY
+      # PREDEPLOY (skipped on destroy)
       ########################################
 
       - name: Run predeploy notebooks
+        if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
         working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
         run: |
           set -euo pipefail
           echo "DEBUG: predeploy notebooks pwd=$(pwd)"
-          echo "DEBUG: checking for databricks.yml in $(pwd)"
           ls -la
 
           for f in deployments/predeploy/notebooks/*; do
@@ -181,7 +185,7 @@ jobs:
 
             out_file="$(mktemp)"
             set +e
-            databricks bundle run "$job" -t "${{ inputs.stage_name }}" -v lz="${LANDING_ZONE}" >"$out_file" 2>&1
+            databricks bundle run "$job" -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" >"$out_file" 2>&1
             rc=$?
             set -e
 
@@ -192,7 +196,6 @@ jobs:
                 rm -f "$out_file"
                 continue
               fi
-
               echo "ERROR: bundle run failed for $job"
               cat "$out_file"
               rm -f "$out_file"
@@ -203,12 +206,11 @@ jobs:
           done
 
       - name: Run predeploy bash
+        if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "DEBUG: predeploy bash pwd=$(pwd)"
           dir="${{ steps.bundle_dir.outputs.bundle_run_dir }}/deployments/predeploy/bash"
-          echo "DEBUG: predeploy bash dir=$dir"
           [[ -d "$dir" ]] || exit 0
           for f in "$dir"/*.sh; do
             [[ -e "$f" ]] || continue
@@ -216,12 +218,11 @@ jobs:
           done
 
       - name: Run predeploy python
+        if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "DEBUG: predeploy python pwd=$(pwd)"
           dir="${{ steps.bundle_dir.outputs.bundle_run_dir }}/deployments/predeploy/python"
-          echo "DEBUG: predeploy python dir=$dir"
           [[ -d "$dir" ]] || exit 0
           for f in "$dir"/*.py; do
             [[ -e "$f" ]] || continue
@@ -233,36 +234,55 @@ jobs:
       ########################################
 
       - name: Validate
+        if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
         working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
         run: |
           set -euo pipefail
           echo "DEBUG: validate pwd=$(pwd)"
-          echo "DEBUG: validate ls"
+          echo "DEBUG: landing_zone=${LANDING_ZONE}"
+          echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
           ls -la
-          databricks bundle validate -t "${{ inputs.stage_name }}" -v lz="${LANDING_ZONE}"
+          # Print resolved workspace host so we can confirm correct target
+          databricks bundle validate -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" | \
+            jq '{workspace: .workspace, bundle: .bundle.name}' || true
+          databricks bundle validate -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}"
 
       - name: Deploy
+        if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
         working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
         run: |
           set -euo pipefail
           echo "DEBUG: deploy pwd=$(pwd)"
-          echo "DEBUG: deploy ls"
+          echo "DEBUG: landing_zone=${LANDING_ZONE}"
+          echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
           ls -la
-          databricks bundle deploy -t "${{ inputs.stage_name }}" -v lz="${LANDING_ZONE}" --auto-approve --force-lock
+          databricks bundle deploy -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" --auto-approve --force-lock
+
+      - name: Destroy
+        if: ${{ inputs.destroy_bundle != '' }}
+        shell: bash
+        working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
+        run: |
+          set -euo pipefail
+          echo "DEBUG: destroy pwd=$(pwd)"
+          echo "DEBUG: landing_zone=${LANDING_ZONE}"
+          echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
+          ls -la
+          databricks bundle destroy -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" --auto-approve --force-lock
 
       ########################################
-      # POSTDEPLOY
+      # POSTDEPLOY (skipped on destroy)
       ########################################
 
       - name: Run postdeploy notebooks
+        if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
         working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
         run: |
           set -euo pipefail
           echo "DEBUG: postdeploy notebooks pwd=$(pwd)"
-          echo "DEBUG: checking for databricks.yml in $(pwd)"
           ls -la
 
           for f in deployments/postdeploy/notebooks/*; do
@@ -273,7 +293,7 @@ jobs:
 
             out_file="$(mktemp)"
             set +e
-            databricks bundle run "$job" -t "${{ inputs.stage_name }}" -v lz="${LANDING_ZONE}" >"$out_file" 2>&1
+            databricks bundle run "$job" -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" >"$out_file" 2>&1
             rc=$?
             set -e
 
@@ -284,7 +304,6 @@ jobs:
                 rm -f "$out_file"
                 continue
               fi
-
               echo "ERROR: bundle run failed for $job"
               cat "$out_file"
               rm -f "$out_file"
@@ -295,12 +314,11 @@ jobs:
           done
 
       - name: Run postdeploy bash
+        if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "DEBUG: postdeploy bash pwd=$(pwd)"
           dir="${{ steps.bundle_dir.outputs.bundle_run_dir }}/deployments/postdeploy/bash"
-          echo "DEBUG: postdeploy bash dir=$dir"
           [[ -d "$dir" ]] || exit 0
           for f in "$dir"/*.sh; do
             [[ -e "$f" ]] || continue
@@ -308,12 +326,11 @@ jobs:
           done
 
       - name: Run postdeploy python
+        if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "DEBUG: postdeploy python pwd=$(pwd)"
           dir="${{ steps.bundle_dir.outputs.bundle_run_dir }}/deployments/postdeploy/python"
-          echo "DEBUG: postdeploy python dir=$dir"
           [[ -d "$dir" ]] || exit 0
           for f in "$dir"/*.py; do
             [[ -e "$f" ]] || continue
