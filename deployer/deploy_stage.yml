@@ -112,24 +112,19 @@ jobs:
 
           echo "DATABRICKS_FED_POLICY_ID=$(echo "$resp" | jq -r '.policy_id // .uid')" >> "$GITHUB_ENV"
 
-      - name: Prepare bundle dir
-        run: |
-          dir="${{ inputs.dbx_bundle_dir }}"
-          [[ -z "$dir" ]] && dir="."
-          echo "BUNDLE_WORKDIR=$dir" >> "$GITHUB_ENV"
-
-      - name: Change to bundle directory
+      - name: Resolve bundle working directory
         id: bundle_dir
         shell: bash
-        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
 
-          echo "DEBUG: github.workspace=$GITHUB_WORKSPACE"
-          echo "DEBUG: starting pwd=$(pwd)"
-          echo "DEBUG: BUNDLE_WORKDIR raw='${BUNDLE_WORKDIR:-}'"
+          # The target repo was checked out to: $GITHUB_WORKSPACE/target-repo
+          # databricks.yml is REQUIRED to be either:
+          #   - in the root of the checked-out target repo (no dbx_bundle_dir), OR
+          #   - in target-repo/<dbx_bundle_dir> (when dbx_bundle_dir is set)
+          # If it isn't there, the pipeline errors: that's a repo config problem.
 
-          dir="${BUNDLE_WORKDIR:-}"
+          dir="${{ inputs.dbx_bundle_dir }}"
           [[ -z "$dir" ]] && dir="."
 
           if [[ "$dir" == "." ]]; then
@@ -138,16 +133,24 @@ jobs:
             resolved_dir="$GITHUB_WORKSPACE/target-repo/$dir"
           fi
 
-          echo "DEBUG: resolved_dir=$resolved_dir"
+          echo "DEBUG: github.workspace=$GITHUB_WORKSPACE"
+          echo "DEBUG: dbx_bundle_dir input='${{ inputs.dbx_bundle_dir }}'"
+          echo "DEBUG: resolved bundle working directory=$resolved_dir"
 
           if [[ ! -d "$resolved_dir" ]]; then
-            echo "ERROR: bundle directory '$resolved_dir' does not exist"
+            echo "ERROR: bundle directory '$resolved_dir' does not exist."
+            echo "ERROR: databricks.yml must be in the target repo root, or in the dbx_bundle_dir subdirectory."
             exit 1
           fi
 
-          echo "DEBUG: listing resolved_dir"
+          echo "DEBUG: contents of resolved bundle working directory:"
           ls -la "$resolved_dir"
 
+          # Write the ABSOLUTE path to GITHUB_ENV so every later step can use it
+          # reliably as its working-directory (step outputs were resolving empty,
+          # which silently fell back to '.' = the central/action repo).
+          echo "BUNDLE_RUN_DIR=$resolved_dir" >> "$GITHUB_ENV"
+          # Keep a step output too for backwards compatibility.
           echo "bundle_run_dir=$resolved_dir" >> "$GITHUB_OUTPUT"
 
       - name: Notify stage started
@@ -172,10 +175,11 @@ jobs:
       - name: Run predeploy notebooks
         if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
-        working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
+        working-directory: ${{ env.BUNDLE_RUN_DIR }}
         run: |
           set -euo pipefail
           echo "DEBUG: predeploy notebooks pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
           ls -la
 
           for f in deployments/predeploy/notebooks/*; do
@@ -209,9 +213,12 @@ jobs:
       - name: Run predeploy bash
         if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
+        working-directory: ${{ env.BUNDLE_RUN_DIR }}
         run: |
           set -euo pipefail
-          dir="${{ steps.bundle_dir.outputs.bundle_run_dir }}/deployments/predeploy/bash"
+          echo "DEBUG: predeploy bash pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
+          dir="deployments/predeploy/bash"
           [[ -d "$dir" ]] || exit 0
           for f in "$dir"/*.sh; do
             [[ -e "$f" ]] || continue
@@ -221,9 +228,12 @@ jobs:
       - name: Run predeploy python
         if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
+        working-directory: ${{ env.BUNDLE_RUN_DIR }}
         run: |
           set -euo pipefail
-          dir="${{ steps.bundle_dir.outputs.bundle_run_dir }}/deployments/predeploy/python"
+          echo "DEBUG: predeploy python pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
+          dir="deployments/predeploy/python"
           [[ -d "$dir" ]] || exit 0
           for f in "$dir"/*.py; do
             [[ -e "$f" ]] || continue
@@ -237,10 +247,11 @@ jobs:
       - name: Validate
         if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
-        working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
+        working-directory: ${{ env.BUNDLE_RUN_DIR }}
         run: |
           set -euo pipefail
           echo "DEBUG: validate pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
           echo "DEBUG: landing_zone=${LANDING_ZONE}"
           echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
           ls -la
@@ -249,10 +260,11 @@ jobs:
       - name: Deploy
         if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
-        working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
+        working-directory: ${{ env.BUNDLE_RUN_DIR }}
         run: |
           set -euo pipefail
           echo "DEBUG: deploy pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
           echo "DEBUG: landing_zone=${LANDING_ZONE}"
           echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
           ls -la
@@ -261,10 +273,11 @@ jobs:
       - name: Destroy
         if: ${{ inputs.destroy_bundle != '' }}
         shell: bash
-        working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
+        working-directory: ${{ env.BUNDLE_RUN_DIR }}
         run: |
           set -euo pipefail
           echo "DEBUG: destroy pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
           echo "DEBUG: landing_zone=${LANDING_ZONE}"
           echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
           ls -la
@@ -277,10 +290,11 @@ jobs:
       - name: Run postdeploy notebooks
         if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
-        working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
+        working-directory: ${{ env.BUNDLE_RUN_DIR }}
         run: |
           set -euo pipefail
           echo "DEBUG: postdeploy notebooks pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
           ls -la
 
           for f in deployments/postdeploy/notebooks/*; do
@@ -314,9 +328,12 @@ jobs:
       - name: Run postdeploy bash
         if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
+        working-directory: ${{ env.BUNDLE_RUN_DIR }}
         run: |
           set -euo pipefail
-          dir="${{ steps.bundle_dir.outputs.bundle_run_dir }}/deployments/postdeploy/bash"
+          echo "DEBUG: postdeploy bash pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
+          dir="deployments/postdeploy/bash"
           [[ -d "$dir" ]] || exit 0
           for f in "$dir"/*.sh; do
             [[ -e "$f" ]] || continue
@@ -326,9 +343,12 @@ jobs:
       - name: Run postdeploy python
         if: ${{ inputs.destroy_bundle == '' }}
         shell: bash
+        working-directory: ${{ env.BUNDLE_RUN_DIR }}
         run: |
           set -euo pipefail
-          dir="${{ steps.bundle_dir.outputs.bundle_run_dir }}/deployments/postdeploy/python"
+          echo "DEBUG: postdeploy python pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
+          dir="deployments/postdeploy/python"
           [[ -d "$dir" ]] || exit 0
           for f in "$dir"/*.py; do
             [[ -e "$f" ]] || continue
