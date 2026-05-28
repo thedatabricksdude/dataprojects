@@ -1,0 +1,278 @@
+name: Notify Orchestrator
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+concurrency:
+  group: orchestrator-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Guard: skip fork PRs (no org vars/secrets available)"
+        id: guard
+        run: |
+          set -euo pipefail
+          PR_HEAD_REPO="${{ github.event.pull_request.head.repo.full_name }}"
+          THIS_REPO="${{ github.repository }}"
+          if [[ "${PR_HEAD_REPO}" != "${THIS_REPO}" ]]; then
+            echo "Fork PR detected. head_repo=${PR_HEAD_REPO} repo=${THIS_REPO}. Skipping orchestrator dispatch."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve dispatch parameters (dev vs merge promote + dbx bundle dir)
+        id: plan
+        if: ${{ steps.guard.outputs.skip != 'true' }}
+        shell: bash
+        env:
+          ACTION: ${{ github.event.action }}
+          MERGED: ${{ github.event.pull_request.merged || 'false' }}
+          PR_BODY: ${{ github.event.pull_request.body || '' }}
+          BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+        run: |
+          set -euo pipefail
+
+          # Default: assume "no dispatch" until we explicitly set event_type & target.
+          event_type=""
+          target=""
+          skip="false"
+          dbx_bundle_dir=""
+
+          # If the PR was closed but not merged, skip dispatch completely.
+          if [[ "${ACTION}" == "closed" && "${MERGED}" != "true" ]]; then
+            echo "PR was closed without merge; skipping orchestrator dispatch."
+            skip="true"
+            echo "skip=${skip}" >> "$GITHUB_OUTPUT"
+            echo "event_type=${event_type}" >> "$GITHUB_OUTPUT"
+            echo "target=${target}" >> "$GITHUB_OUTPUT"
+            echo "dbx_bundle_dir=${dbx_bundle_dir}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Default behavior for open/synchronize/reopen => DEV-only dispatch
+          event_type="deploy_dev"
+          target="dev"
+
+          if [[ "${ACTION}" == "closed" && "${MERGED}" == "true" ]]; then
+            # safety: only permit promote if merged into main
+            if [[ "${BASE_REF}" != "main" ]]; then
+              echo "ERROR: PR merged into '${BASE_REF}'. Promote is only allowed when merged into 'main'."
+              exit 1
+            fi
+
+            # Promote path: extract checked deployment target
+            event_type="promote"
+
+            mapfile -t checked < <(
+              printf '%s\n' "${PR_BODY}" \
+                | sed -nE 's/^[[:space:]]*-[[:space:]]*\[[xX]\][[:space:]]*([a-z0-9-]+)[[:space:]]*$/\1/p'
+            )
+
+            # Filter to only known targets (defensive)
+            valid=()
+            for v in "${checked[@]}"; do
+              case "${v}" in
+                qa|uat|prod|qa-uat|qa-uat-prod) valid+=("${v}") ;;
+                *) : ;;
+              esac
+            done
+
+            count=${#valid[@]}
+            if (( count == 0 )); then
+              echo "ERROR: PR merged but no Deployment Target checkbox was selected."
+              echo "Select exactly one of: qa, uat, prod, qa-uat, qa-uat-prod"
+              exit 1
+            fi
+
+            if (( count > 1 )); then
+              echo "ERROR: Multiple deployment targets selected. Choose exactly one."
+              echo "${valid[*]}"
+              exit 1
+            fi
+
+            target="${valid[0]}"
+          fi
+
+          # Extract DBX_BUNDLE_DIR from PR body if present.
+          # Accept syntaxes like:
+          #   DBX_BUNDLE_DIR: path/to/dir
+          #   dbx_bundle_dir=path/to/dir
+          dbx_bundle_dir="$(printf '%s\n' "${PR_BODY}" \
+            | grep -Eoi 'DBX_BUNDLE_DIR[:=][[:space:]]*[^[:space:]]+' | head -n1 || true)"
+          if [[ -n "${dbx_bundle_dir}" ]]; then
+            dbx_bundle_dir="$(printf '%s' "${dbx_bundle_dir}" | sed -E 's/.*[:=][[:space:]]*//I' | xargs)"
+          fi
+
+          echo "skip=${skip}" >> "$GITHUB_OUTPUT"
+          echo "event_type=${event_type}" >> "$GITHUB_OUTPUT"
+          echo "target=${target}" >> "$GITHUB_OUTPUT"
+          echo "dbx_bundle_dir=${dbx_bundle_dir}" >> "$GITHUB_OUTPUT"
+
+      - name: Debug resolved plan
+        if: ${{ steps.guard.outputs.skip != 'true' && steps.plan.outputs.skip != 'true' && env.DEBUG != '' }}
+        run: |
+          echo "event_type=${{ steps.plan.outputs.event_type || 'n/a' }}"
+          echo "target=${{ steps.plan.outputs.target || 'n/a' }}"
+          echo "dbx_bundle_dir=${{ steps.plan.outputs.dbx_bundle_dir || 'n/a' }}"
+
+      - name: Generate GitHub App Token
+        id: generate-token
+        if: ${{ steps.guard.outputs.skip != 'true' && steps.plan.outputs.skip != 'true' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: CLADevOps
+
+      - name: Dispatch to orchestrator_promoter (branch or repository strategy)
+        id: do_dispatch
+        if: ${{ steps.guard.outputs.skip != 'true' && steps.plan.outputs.skip != 'true' }}
+        env:
+          ORCHESTRATOR_TOKEN: ${{ steps.generate-token.outputs.token }}
+          ORG: ${{ vars.orgname }}
+          ORCHESTRATOR_REPO: ${{ vars.orchestrator_repo }}
+
+          # If BETA branch is set (non-empty), we will call workflow_dispatch to that branch.
+          # You can set either vars.BETA_BRANCH or vars.ORCHESTRATOR_BETA_BRANCH
+          BETA_BRANCH: ${{ vars.BETA_BRANCH || vars.ORCHESTRATOR_BETA_BRANCH || '' }}
+
+          # Plan outputs
+          PLAN_EVENT_TYPE: ${{ steps.plan.outputs.event_type }}
+          PLAN_TARGET: ${{ steps.plan.outputs.target }}
+          PLAN_DBX_BUNDLE_DIR: ${{ steps.plan.outputs.dbx_bundle_dir || '' }}
+
+          # commit SHAs from PR event; we choose merge_commit_sha for promote (landing commit)
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGED_SHA: ${{ github.event.pull_request.merge_commit_sha || '' }}
+
+          REPO_FULL_NAME: ${{ github.repository }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          REF_NAME: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SENDER: ${{ github.actor }}
+          ORCHESTRATOR_WORKFLOW: ${{ vars.orchestrator_workflow || 'orchestrator_promoter.yml' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Choose SHA: for promote use merged commit if available (the commit that landed on main),
+          # otherwise fall back to head SHA (dev dispatch).
+          SHA="${HEAD_SHA}"
+          if [[ "${PLAN_EVENT_TYPE:-}" == "promote" && -n "${MERGED_SHA:-}" ]]; then
+            SHA="${MERGED_SHA}"
+          fi
+
+          # Compose inner client_payload (only the inner payload, compact)
+          client_payload="$(jq -n \
+            --arg repo_full_name "${REPO_FULL_NAME}" \
+            --arg repo "${REPO_NAME}" \
+            --arg sha "${SHA}" \
+            --arg ref "${REF_NAME}" \
+            --arg sender "${SENDER}" \
+            --arg target "${PLAN_TARGET}" \
+            --arg pr_number "${PR_NUMBER}" \
+            --arg dbx_bundle_dir "${PLAN_DBX_BUNDLE_DIR:-}" \
+            '{
+              repo_full_name: $repo_full_name,
+              repo: $repo,
+              sha: $sha,
+              ref: $ref,
+              sender: $sender,
+              target: $target,
+              pr_number: $pr_number,
+              dbx_bundle_dir: $dbx_bundle_dir
+            }')"
+
+          # Outer body for repository_dispatch fallback
+          body="$(jq -n \
+            --arg type "${PLAN_EVENT_TYPE}" \
+            --argjson payload "${client_payload}" \
+            '{event_type: $type, client_payload: $payload}')"
+
+          if [[ -n "${BETA_BRANCH:-}" ]]; then
+            echo "BETA_BRANCH is set to '${BETA_BRANCH}'. Using workflow_dispatch to ${ORG}/${ORCHESTRATOR_REPO}@${BETA_BRANCH}"
+
+            # Build a workflow_dispatch body that runs the orchestrator workflow from the given branch.
+            # We pass the inner client_payload as a compact JSON string in input client_payload_json,
+            # plus explicit input for dbx_bundle_dir.
+            wf_body="$(jq -n \
+              --arg ref "${BETA_BRANCH}" \
+              --arg payload_json "$(printf '%s' "${client_payload}" | jq -c -M '.')" \
+              --arg event_type "${PLAN_EVENT_TYPE}" \
+              --arg target "${PLAN_TARGET}" \
+              --arg dbx_bundle_dir "${PLAN_DBX_BUNDLE_DIR:-}" \
+              '{
+                ref: $ref,
+                inputs: {
+                  client_payload_json: $payload_json,
+                  event_type: $event_type,
+                  target: $target,
+                  dbx_bundle_dir: $dbx_bundle_dir
+                }
+              }')"
+
+            echo "${wf_body}" | jq .
+
+            out="$(mktemp)"
+            status="$(curl -sS -w "%{http_code}" -o "${out}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${ORCHESTRATOR_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -X POST \
+              "https://api.github.com/repos/${ORG}/${ORCHESTRATOR_REPO}/actions/workflows/${ORCHESTRATOR_WORKFLOW}/dispatches" \
+              -d "${wf_body}" || echo "000")"
+
+            body_out="$(cat "${out}" || true)"
+            rm -f "${out}" || true
+
+            if [[ -z "${status}" || "${status}" == "000" || "${status}" -ge 400 ]]; then
+              echo "ERROR: workflow_dispatch failed (HTTP ${status})"
+              if [[ -n "${body_out}" ]]; then
+                echo "Response body:"
+                printf '%s\n' "${body_out}"
+              fi
+              exit 1
+            fi
+
+            echo "workflow_dispatch OK (HTTP ${status})"
+          else
+            echo "BETA_BRANCH not set; using repository_dispatch to ${ORG}/${ORCHESTRATOR_REPO}"
+            echo "${body}" | jq .
+
+            out="$(mktemp)"
+            status="$(curl -sS -w "%{http_code}" -o "${out}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${ORCHESTRATOR_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -X POST \
+              "https://api.github.com/repos/${ORG}/${ORCHESTRATOR_REPO}/dispatches" \
+              -d "${body}" || echo "000")"
+
+            body_out="$(cat "${out}" || true)"
+            rm -f "${out}" || true
+
+            if [[ -z "${status}" || "${status}" == "000" || "${status}" -ge 400 ]]; then
+              echo "ERROR: repository_dispatch failed (HTTP ${status})"
+              if [[ -n "${body_out}" ]]; then
+                echo "Response body:"
+                printf '%s\n' "${body_out}"
+              fi
+              exit 1
+            fi
+
+            echo "repository_dispatch OK (HTTP ${status})"
+          fi
+
+      - name: Done (skipped due to fork or closed-unmerged)
+        if: ${{ steps.guard.outputs.skip == 'true' || steps.plan.outputs.skip == 'true' }}
+        run: |
+          echo "Orchestration skipped (fork or closed/unmerged PR)."

@@ -1,0 +1,533 @@
+name: Deploy stage (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        required: true
+        type: string
+      sha:
+        required: true
+        type: string
+      pr_number:
+        required: false
+        type: string
+      stage_name:
+        required: true
+        type: string
+      target_env:
+        required: true
+        type: string
+      dbx_bundle_dir:
+        required: false
+        type: string
+      debug:
+        required: false
+        type: string
+      landing_zone:
+        required: false
+        type: string
+        default: default
+      destroy_bundle:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      GH_APP_PRIVATE_KEY:
+        required: true
+      DEPLOYER_CLIENT_SECRET:
+        required: true
+      DATABRICKS_ACCOUNT_ID:
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target_env }}
+
+    env:
+      TARGET_ENV: ${{ inputs.target_env }}
+      DATABRICKS_AUTH_TYPE: github-oidc
+      DATABRICKS_CLIENT_ID: ${{ vars.DEPLOYER_CLIENT_ID }}
+      DEBUG: ${{ inputs.debug || '' }}
+      KEEP_FED_POLICY: ${{ vars.KEEP_FED_POLICY || 'false' }}
+      LANDING_ZONE: ${{ inputs.landing_zone != '' && inputs.landing_zone || 'default' }}
+      DESTROY_BUNDLE: ${{ inputs.destroy_bundle || '' }}
+
+    steps:
+      - name: Generate GitHub App Token
+        id: generate-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: CLADevOps
+          permission-contents: write
+          permission-issues: write
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.sha }}
+          token: ${{ steps.generate-token.outputs.token }}
+          path: source-repo
+
+      - name: Install uv
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install Databricks CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+
+      - name: Get OAuth token
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          token_json="$(curl -sS -X POST \
+            "https://login.microsoftonline.com/${{ vars.DEPLOYER_TENANT_ID }}/oauth2/v2.0/token" \
+            -d "client_id=${{ vars.DEPLOYER_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.DEPLOYER_CLIENT_SECRET }}" \
+            -d "grant_type=client_credentials" \
+            -d "scope=2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default")"
+
+          access_token="$(echo "$token_json" | jq -r '.access_token')"
+          if [[ -z "$access_token" || "$access_token" == "null" ]]; then
+            echo "ERROR: Failed to obtain access token."
+            echo "$token_json"
+            exit 1
+          fi
+
+          echo "ACCOUNT_OAUTH_TOKEN=$access_token" >> "$GITHUB_ENV"
+
+      - name: Resolve Databricks host for landing zone
+        shell: bash
+        env:
+          LANDING_ZONE_HOSTS_JSON: ${{ vars.LANDING_ZONE_HOSTS_JSON || '{}' }}
+        run: |
+          set -euo pipefail
+
+          lz="${LANDING_ZONE:-default}"
+          [[ -z "$lz" ]] && lz="default"
+
+          stage="${{ inputs.stage_name }}"
+          stage="$(printf '%s' "$stage" | tr '[:upper:]' '[:lower:]' | xargs)"
+          if [[ -z "$stage" ]]; then
+            echo "ERROR: inputs.stage_name is required to resolve Databricks host."
+            exit 1
+          fi
+
+          lookup_key="${lz}_${stage}"
+
+          echo "Resolving Databricks host for landing zone: ${lz}"
+          echo "Resolving Databricks host for stage: ${stage}"
+          echo "LANDING_ZONE_HOSTS_JSON lookup key: ${lookup_key}"
+
+          if ! printf '%s' "$LANDING_ZONE_HOSTS_JSON" | jq empty >/dev/null 2>&1; then
+            echo "ERROR: vars.LANDING_ZONE_HOSTS_JSON is not valid JSON."
+            echo "Value received:"
+            printf '%s\n' "$LANDING_ZONE_HOSTS_JSON"
+            exit 1
+          fi
+
+          host="$(printf '%s' "$LANDING_ZONE_HOSTS_JSON" | jq -r --arg lookup_key "$lookup_key" '.[$lookup_key] // empty')"
+
+          if [[ -z "$host" || "$host" == "null" ]]; then
+            echo "ERROR: No Databricks host found for lookup key '${lookup_key}'."
+            echo "vars.LANDING_ZONE_HOSTS_JSON must include an exact key for landing zone and stage, for example '${lookup_key}'."
+            echo "Available landing-zone host keys:"
+            printf '%s' "$LANDING_ZONE_HOSTS_JSON" | jq -r 'keys[]?' || true
+            exit 1
+          fi
+
+          host="${host%/}"
+
+          echo "Resolved Databricks host for key '${lookup_key}': ${host}"
+          echo "DATABRICKS_HOST=${host}" >> "$GITHUB_ENV"
+
+      - name: Create Federation Policy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${DATABRICKS_HOST:-}" ]]; then
+            echo "ERROR: DATABRICKS_HOST was not resolved before creating federation policy."
+            exit 1
+          fi
+
+          payload="$(jq -n \
+            --arg issuer "https://token.actions.githubusercontent.com" \
+            --arg aud "${DATABRICKS_HOST}/oidc/v1/token" \
+            --arg sub "repo:${{ inputs.repo }}:environment:${TARGET_ENV}" \
+            '{ oidc_policy: { issuer: $issuer, audiences: [$aud], subject: $sub } }')"
+
+          resp="$(curl -sS -X POST \
+            "${{ vars.DATABRICKS_ACCOUNT_HOST }}/api/2.0/accounts/${{ secrets.DATABRICKS_ACCOUNT_ID }}/servicePrincipals/${{ vars.DEPLOYER_PRINCIPAL_ID }}/federationPolicies" \
+            -H "Authorization: Bearer $ACCOUNT_OAUTH_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$payload")"
+
+          policy_id="$(echo "$resp" | jq -r '.policy_id // .uid // empty')"
+          if [[ -z "$policy_id" || "$policy_id" == "null" ]]; then
+            echo "ERROR: Could not extract federation policy id from response."
+            echo "$resp"
+            exit 1
+          fi
+
+          echo "DATABRICKS_FED_POLICY_ID=$policy_id" >> "$GITHUB_ENV"
+
+      - name: Resolve bundle working directory
+        id: bundle_dir
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source_repo_dir="$GITHUB_WORKSPACE/source-repo"
+
+          echo "DEBUG: github.workspace=$GITHUB_WORKSPACE"
+          echo "DEBUG: source_repo_dir=$source_repo_dir"
+          echo "DEBUG: input repo=${{ inputs.repo }}"
+          echo "DEBUG: input sha=${{ inputs.sha }}"
+          echo "DEBUG: dbx_bundle_dir input='${{ inputs.dbx_bundle_dir }}'"
+          echo "DEBUG: landing_zone=${LANDING_ZONE}"
+          echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
+
+          if [[ ! -d "$source_repo_dir" ]]; then
+            echo "ERROR: source repo checkout directory does not exist: $source_repo_dir"
+            echo "DEBUG: contents of GITHUB_WORKSPACE:"
+            ls -la "$GITHUB_WORKSPACE"
+            exit 1
+          fi
+
+          echo "DEBUG: git remote from source repo:"
+          git -C "$source_repo_dir" remote -v || true
+
+          echo "DEBUG: git HEAD from source repo:"
+          git -C "$source_repo_dir" rev-parse HEAD || true
+
+          actual_sha="$(git -C "$source_repo_dir" rev-parse HEAD || true)"
+          if [[ -n "$actual_sha" && "$actual_sha" != "${{ inputs.sha }}" ]]; then
+            echo "ERROR: checked out SHA does not match requested SHA."
+            echo "Expected: ${{ inputs.sha }}"
+            echo "Actual:   $actual_sha"
+            exit 1
+          fi
+
+          dir="${{ inputs.dbx_bundle_dir }}"
+          [[ -z "$dir" ]] && dir="."
+
+          if [[ "$dir" == "." ]]; then
+            resolved_dir="$source_repo_dir"
+          else
+            resolved_dir="$source_repo_dir/${dir#./}"
+          fi
+
+          echo "DEBUG: resolved bundle working directory=$resolved_dir"
+
+          if [[ ! -d "$resolved_dir" ]]; then
+            echo "ERROR: bundle directory '$resolved_dir' does not exist."
+            echo "ERROR: databricks.yml must be in the source repo root, or in the dbx_bundle_dir subdirectory."
+            exit 1
+          fi
+
+          if [[ ! -f "$resolved_dir/databricks.yml" ]]; then
+            echo "ERROR: databricks.yml not found in '$resolved_dir'."
+            echo "DEBUG: contents of resolved bundle working directory:"
+            ls -la "$resolved_dir"
+            exit 1
+          fi
+
+          echo "DEBUG: contents of resolved bundle working directory:"
+          ls -la "$resolved_dir"
+
+          echo "BUNDLE_RUN_DIR=$resolved_dir" >> "$GITHUB_ENV"
+          echo "bundle_run_dir=$resolved_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Notify stage started
+        if: ${{ inputs.pr_number != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body="$(jq -n \
+            --arg msg "🚀 ${TARGET_ENV} [${LANDING_ZONE}] deployment started"$'\n'"Run: ${RUN_URL}" \
+            '{body: $msg}')"
+
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${{ steps.generate-token.outputs.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ inputs.repo }}/issues/${{ inputs.pr_number }}/comments" \
+            -d "$body"
+
+      ########################################
+      # PREDEPLOY
+      ########################################
+
+      - name: Run predeploy notebooks
+        if: ${{ inputs.destroy_bundle == '' }}
+        shell: bash
+        working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
+        run: |
+          set -euo pipefail
+
+          echo "DEBUG: predeploy notebooks pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
+          echo "DEBUG: landing_zone=${LANDING_ZONE}"
+          echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
+          ls -la
+
+          for f in deployments/predeploy/notebooks/*; do
+            [[ -f "$f" ]] || continue
+
+            name="$(basename "$f")"
+            job="${name%.*}"
+
+            echo "Running bundle job: $job (lz=${LANDING_ZONE})"
+
+            out_file="$(mktemp)"
+
+            set +e
+            databricks bundle run "$job" -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" >"$out_file" 2>&1
+            rc=$?
+            set -e
+
+            if (( rc != 0 )); then
+              if grep -qiE 'resource with key ".*" not found|job ID is not an integer|resource .* not found' "$out_file"; then
+                echo "Skipping $job because it does not appear to be deployed yet."
+                cat "$out_file"
+                rm -f "$out_file"
+                continue
+              fi
+
+              echo "ERROR: bundle run failed for $job"
+              cat "$out_file"
+              rm -f "$out_file"
+              exit "$rc"
+            fi
+
+            rm -f "$out_file"
+          done
+
+      - name: Run predeploy bash
+        if: ${{ inputs.destroy_bundle == '' }}
+        shell: bash
+        working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
+        run: |
+          set -euo pipefail
+
+          echo "DEBUG: predeploy bash pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
+          echo "DEBUG: landing_zone=${LANDING_ZONE}"
+          echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
+
+          dir="deployments/predeploy/bash"
+          [[ -d "$dir" ]] || exit 0
+
+          for f in "$dir"/*.sh; do
+            [[ -e "$f" ]] || continue
+            bash "$f"
+          done
+
+      - name: Run predeploy python
+        if: ${{ inputs.destroy_bundle == '' }}
+        shell: bash
+        working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
+        run: |
+          set -euo pipefail
+
+          echo "DEBUG: predeploy python pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
+          echo "DEBUG: landing_zone=${LANDING_ZONE}"
+          echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
+
+          dir="deployments/predeploy/python"
+          [[ -d "$dir" ]] || exit 0
+
+          for f in "$dir"/*.py; do
+            [[ -e "$f" ]] || continue
+            python "$f"
+          done
+
+      ########################################
+      # DEPLOY
+      ########################################
+
+      - name: Validate
+        if: ${{ inputs.destroy_bundle == '' }}
+        shell: bash
+        working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
+        run: |
+          set -euo pipefail
+
+          echo "DEBUG: validate pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
+          echo "DEBUG: landing_zone=${LANDING_ZONE}"
+          echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
+          ls -la
+
+          databricks bundle validate -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" --output json | jq .
+
+      - name: Deploy
+        if: ${{ inputs.destroy_bundle == '' }}
+        shell: bash
+        working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
+        run: |
+          set -euo pipefail
+
+          echo "DEBUG: deploy pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
+          echo "DEBUG: landing_zone=${LANDING_ZONE}"
+          echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
+          ls -la
+
+          databricks bundle deploy -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" --auto-approve --force-lock
+
+      - name: Destroy
+        if: ${{ inputs.destroy_bundle != '' }}
+        shell: bash
+        working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
+        run: |
+          set -euo pipefail
+
+          echo "DEBUG: destroy pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
+          echo "DEBUG: landing_zone=${LANDING_ZONE}"
+          echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
+          ls -la
+
+          databricks bundle destroy -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" --auto-approve --force-lock
+
+      ########################################
+      # POSTDEPLOY
+      ########################################
+
+      - name: Run postdeploy notebooks
+        if: ${{ inputs.destroy_bundle == '' }}
+        shell: bash
+        working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
+        run: |
+          set -euo pipefail
+
+          echo "DEBUG: postdeploy notebooks pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
+          echo "DEBUG: landing_zone=${LANDING_ZONE}"
+          echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
+          ls -la
+
+          for f in deployments/postdeploy/notebooks/*; do
+            [[ -f "$f" ]] || continue
+
+            name="$(basename "$f")"
+            job="${name%.*}"
+
+            echo "Running bundle job: $job (lz=${LANDING_ZONE})"
+
+            out_file="$(mktemp)"
+
+            set +e
+            databricks bundle run "$job" -t "${{ inputs.stage_name }}" --var="lz=${LANDING_ZONE}" >"$out_file" 2>&1
+            rc=$?
+            set -e
+
+            if (( rc != 0 )); then
+              if grep -qiE 'resource with key ".*" not found|job ID is not an integer|resource .* not found' "$out_file"; then
+                echo "Skipping $job because it does not appear to be deployed yet."
+                cat "$out_file"
+                rm -f "$out_file"
+                continue
+              fi
+
+              echo "ERROR: bundle run failed for $job"
+              cat "$out_file"
+              rm -f "$out_file"
+              exit "$rc"
+            fi
+
+            rm -f "$out_file"
+          done
+
+      - name: Run postdeploy bash
+        if: ${{ inputs.destroy_bundle == '' }}
+        shell: bash
+        working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
+        run: |
+          set -euo pipefail
+
+          echo "DEBUG: postdeploy bash pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
+          echo "DEBUG: landing_zone=${LANDING_ZONE}"
+          echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
+
+          dir="deployments/postdeploy/bash"
+          [[ -d "$dir" ]] || exit 0
+
+          for f in "$dir"/*.sh; do
+            [[ -e "$f" ]] || continue
+            bash "$f"
+          done
+
+      - name: Run postdeploy python
+        if: ${{ inputs.destroy_bundle == '' }}
+        shell: bash
+        working-directory: ${{ steps.bundle_dir.outputs.bundle_run_dir }}
+        run: |
+          set -euo pipefail
+
+          echo "DEBUG: postdeploy python pwd=$(pwd)"
+          echo "DEBUG: BUNDLE_RUN_DIR=$BUNDLE_RUN_DIR"
+          echo "DEBUG: landing_zone=${LANDING_ZONE}"
+          echo "DEBUG: DATABRICKS_HOST=${DATABRICKS_HOST}"
+
+          dir="deployments/postdeploy/python"
+          [[ -d "$dir" ]] || exit 0
+
+          for f in "$dir"/*.py; do
+            [[ -e "$f" ]] || continue
+            python "$f"
+          done
+
+      ########################################
+      # CLEANUP
+      ########################################
+
+      - name: Delete Federation Policy
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ -z "${DATABRICKS_FED_POLICY_ID:-}" ]] && exit 0
+
+          curl -sS -X DELETE \
+            "${{ vars.DATABRICKS_ACCOUNT_HOST }}/api/2.0/accounts/${{ secrets.DATABRICKS_ACCOUNT_ID }}/servicePrincipals/${{ vars.DEPLOYER_PRINCIPAL_ID }}/federationPolicies/$DATABRICKS_FED_POLICY_ID" \
+            -H "Authorization: Bearer $ACCOUNT_OAUTH_TOKEN"
+
+      - name: Notify stage complete
+        if: ${{ always() && inputs.pr_number != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          STATUS="${{ job.status }}"
+          body="$(jq -n \
+            --arg msg "${STATUS} ${TARGET_ENV} [${LANDING_ZONE}] deployment finished"$'\n'"Run: ${RUN_URL}" \
+            '{body: $msg}')"
+
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${{ steps.generate-token.outputs.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ inputs.repo }}/issues/${{ inputs.pr_number }}/comments" \
+            -d "$body"
